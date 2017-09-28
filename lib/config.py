@@ -5,6 +5,7 @@ import ConfigParser
 
 class Config:
     def __init__(self, conf_file):
+        self.salt = 'ConclusionCore'
         self.conf_file = conf_file
         self.vm_list = {}
         self.supported_hypervisors = ['vmware', 'ovirt', 'rhev']
@@ -63,6 +64,22 @@ class Config:
                     except:
                         print "No freeipa password specified. Will continue but cannot register the host in any additional hostgroups"
                         self.freeipa_password = ''
+                try:
+                    self.vm_type = self.config.get(section, 'vm_type')
+                except:
+                    print "No vm_type defined. Asuming 'other'"
+                    self.vm_type = 'other'
+                if self.vm_type.lower() == 'oracle-rac':
+                    try:
+                        self.shared_disks = self.config.get(section, 'shared_disks').split(',')
+                        self.shared_disks = [disk.strip() for disk in self.shared_disks]
+                    except:
+                        print "No shared disks specified for vm_type oracle-rac. Cannot continue"
+                        sys.exit(99)
+                try:
+                    self.use_fqdn_as_name = int(self.config.get(section, 'use_fqdn_as_name'))
+                except:
+                    self.use_fqdn_as_name = 1
             else:
                 vm_list[section] = {}
                 try:
@@ -71,14 +88,18 @@ class Config:
                     print "No osfamily specified (linux or windows). Cannot continue"
                     sys.exit(99)
                 try:
-                    vm_list[section]['vm_domain'] = self.config.get(section, 'vm_domain')
+                    vm_list[section]['vm_domain'] = self.config.get(section, 'vm_domain').lower()
                 except:
                     print "No domain provided."
                     vm_list[section]['vm_domain'] = ''
+                try:
+                    vm_list[section]['vm_exists'] = int(self.config.get(section, 'vm_exists'))
+                except:
+                    vm_list[section]['vm_exists'] = 0
                 if vm_list[section]['vm_domain'] == '':
-                    vm_list[section]['vm_fqdn'] = section
+                    vm_list[section]['vm_fqdn'] = section.lower()
                 else:
-                   vm_list[section]['vm_fqdn'] = section + '.' + vm_list[section]['vm_domain']
+                   vm_list[section]['vm_fqdn'] = section.lower() + '.' + vm_list[section]['vm_domain']
                 try:
                     vm_list[section]['vm_cluster'] = self.config.get(section, 'vm_cluster')
                 except:
@@ -154,6 +175,11 @@ class Config:
                     print "No number of cpu's provided. Assuming default of 1"
                     vm_list[section]['vm_cpus'] = 1
                 try:
+                    vm_list[section]['vm_cores_per_cpu'] = self.config.get(section, 'vm_cores_per_cpu')
+                except:
+                    print "No number of cores per cpu's provided. Assuming default of 1"
+                    vm_list[section]['vm_cores_per_cpu'] = 1
+                try:
                     vm_list[section]['vm_disks'] = self.config.get(section, 'vm_disks').split(',')
                     vm_list[section]['vm_disks'] = [disk.strip() for disk in vm_list[section]['vm_disks']]
                 except:
@@ -169,6 +195,19 @@ class Config:
                 except:
                     print "No VLAN provided. You can still access the VM, but only through the console."
                     vm_list[section]['vm_networks'] = []
+                try:
+                    vm_list[section]['vm_network_type'] = self.config.get(section, 'vm_network_type').lower()
+                except:
+                    print "No network_type provided. Assuming 'standard' (NOT distributed v-switch)"
+                    vm_list[section]['vm_network_type'] = 'standard'
+                try:
+                    vm_list[section]['vm_macaddress'] = self.config.get(section, 'vm_macaddress')
+                except:
+                    if vm_list[section]['vm_exists'] == 1:
+                        print "No MAC address provided but the VM does allready exist. I don't know what to do"
+                        sys.exit(99)
+                    else:
+                        vm_list[section]['vm_macaddress'] = ''
                 try:
                     vm_list[section]['vm_ipaddress'] = self.config.get(section, 'vm_ipaddress')
                 except:
@@ -245,5 +284,20 @@ class Config:
                 except:
                     print "No IPA hostgroup specified. Not adding host to any hostgroup"
                     vm_list[section]['ipa_hostgroup'] = ''
+                try:
+                    import ast
+                    vm_list[section]['override_parameters'] = ast.literal_eval(self.config.get(section, 'override_parameters'))
+                except:
+                    vm_list[section]['override_parameters'] = []
+                try:
+                     vm_list[section]['ossec_in_env'] = int(self.config.get(section, 'ossec_in_env'))
+                except:
+                    vm_list[section]['ossec_in_env'] = 1
+                try:
+                    vm_list[section]['deploy_via_wds'] = int(self.config.get(section, 'deploy_via_wds'))
+                except:
+                    vm_list[section]['deploy_via_wds'] = 0
+
                 self.vm_list = vm_list
+
 

@@ -6,7 +6,7 @@
 
 #this script requires pysphere
 
-from pysphere import VIServer, VIProperty, MORTypes
+from pysphere import VIServer, VIProperty, MORTypes, VIApiException
 from pysphere.resources import VimService_services as VI
 from pysphere.vi_task import VITask
 
@@ -18,9 +18,54 @@ def connectToHost(host,host_user,host_pw):
         s.connect(host,host_user,host_pw)
         return s
     except VIApiException, err:
-        print "Cannot connect to host: "+host+" error message: "+err    
+        print "Cannot connect to host: '%s', error message: %s" %(host,err)    
 
-def createGuest(host_con,guest_dc,guest_dc_folder,guest_host,guest_name,guest_ver,guest_mem,guest_cpu,guest_iso,guest_os,guest_disks_gb,guest_ds,guest_networks):
+def __get_dvsuuid_portgroup(host_con, dc_props, net_name):
+    # networkFolder managed object reference
+    nf_mor = dc_props.networkFolder._obj
+    dvpg_mors = host_con._retrieve_properties_traversal(property_names=['name','key'],from_node=nf_mor, obj_type='DistributedVirtualPortgroup')
+    # Get the portgroup managed object.
+    dvpg_mor = None
+    for dvpg in dvpg_mors:
+        if dvpg_mor:
+            break
+        for p in dvpg.PropSet:
+            if p.Name == "name" and p.Val == net_name:
+                dvpg_mor = dvpg
+            if dvpg_mor:
+                break
+    if dvpg_mor == None:
+        return "Didn't find the network '%s', exiting now" % (net_name)
+    # Get the portgroup key
+    portgroupKey = None
+    for p in dvpg_mor.PropSet:
+        if p.Name == "key":
+            portgroupKey = p.Val
+    # Grab the dvswitch uuid and portgroup properties
+    dvswitch_mors = host_con._retrieve_properties_traversal(property_names=['uuid','portgroup'], from_node=nf_mor, obj_type='DistributedVirtualSwitch')
+    # Get the appropriate dvswitches managed object
+    dvswitch_mor = None
+    for dvswitch in dvswitch_mors:
+        if dvswitch_mor:
+            break
+        for p in dvswitch.PropSet:
+            if p.Name == "portgroup":
+                pg_mors = p.Val.ManagedObjectReference
+                for pg_mor in pg_mors:
+                    if dvswitch_mor:
+                        break
+                    key_mor = host_con._get_object_properties(pg_mor, property_names=['key'])
+                    for key in key_mor.PropSet:
+                        if key.Val == portgroupKey:
+                            dvswitch_mor = dvswitch
+    # Get the switches uuid
+    dvswitch_uuid = None
+    for p in dvswitch_mor.PropSet:
+        if p.Name == "uuid":
+            dvswitch_uuid = p.Val
+    return (dvswitch_uuid, portgroupKey)
+
+def createGuest(host_con,guest_dc,guest_dc_folder,guest_host,guest_name,guest_ver,guest_mem,guest_cpu,guest_cores,guest_purpose,guest_iso,guest_os,guest_disks_gb,guest_ds,guest_networks,network_type='standard'):
     #get dc MOR from list
     dc_list=[k for k,v in host_con.get_datacenters().items() if v==guest_dc]
     if dc_list:
@@ -34,12 +79,20 @@ def createGuest(host_con,guest_dc,guest_dc_folder,guest_host,guest_name,guest_ve
     if guest_dc_folder == '':
         vmf_mor = dc_props.vmFolder._obj
     else:
+        #First get all folders from root
         folders = host_con._retrieve_properties_traversal(property_names=['name'], from_node=dc_mor, obj_type='Folder')
-        for f in folders:
-            if f.PropSet[0].Val == guest_dc_folder:
-                vmf_mor = f.Obj
-                break
-        if not vmf_mor:
+
+        subfolders = guest_dc_folder.split('/')
+        found_folder = []
+        for sf in subfolders:
+            for f in folders:
+                if f.PropSet[0].Val == sf:
+                    #Get subfolders from found parent folder
+                    folders = host_con._retrieve_properties_traversal(property_names=['name'], from_node=f.Obj, obj_type='Folder')
+                    found_folder.append(str(f.PropSet[0].Val))
+        if found_folder == subfolders:
+            vmf_mor = folders[0].Obj
+        else:
             print "Datacenter folder '%s' not found. Placing VM in root folder of Datacenter '%s'" % (guest_dc_folder, guest_dc)
             vmf_mor = dc_props.vmFolder._obj
     #get hostfolder MOR
@@ -95,6 +148,7 @@ def createGuest(host_con,guest_dc,guest_dc_folder,guest_host,guest_name,guest_ve
             net_name = guest_networks[0]
             net_names = None
         else:
+            net_name = None
             net_names = guest_networks
     else:
         for net in config_target.Network: 
@@ -128,9 +182,11 @@ def createGuest(host_con,guest_dc,guest_dc_folder,guest_host,guest_name,guest_ve
     config.set_element_name(guest_name) 
     config.set_element_memoryMB(guest_mem) 
     config.set_element_memoryHotAddEnabled(True)
-    config.set_element_numCPUs(guest_cpu) 
+    config.set_element_numCoresPerSocket(guest_cores)
+    config.set_element_numCPUs(guest_cpu*guest_cores)
     config.set_element_guestId(guest_os)
     config.set_element_cpuHotAddEnabled(True)
+    config.set_element_annotation(guest_purpose)
     
     #create devices
     devices = [] 
@@ -174,6 +230,7 @@ def createGuest(host_con,guest_dc,guest_dc_folder,guest_host,guest_name,guest_ve
     disk_backing=VI.ns0.VirtualDiskFlatVer2BackingInfo_Def("disk_backing").pyclass() 
     disk_backing.set_element_fileName(ds_vol_name) 
     disk_backing.set_element_diskMode("persistent") 
+    disk_backing.set_element_eagerlyScrub(True)
     disk_ctlr.set_element_key(0) 
     disk_ctlr.set_element_controllerKey(disk_ctrl_key) 
     disk_ctlr.set_element_unitNumber(0) 
@@ -205,31 +262,55 @@ def createGuest(host_con,guest_dc,guest_dc_folder,guest_host,guest_name,guest_ve
             unit_number += 1
 
     #add a network controller
-    nic_spec = config.new_deviceChange() 
-    if net_name: 
-        nic_spec.set_element_operation("add") 
-        nic_ctlr = VI.ns0.VirtualVmxnet3_Def("nic_ctlr").pyclass() 
-        #nic_ctlr = VI.ns0.VirtualPCNet32_Def("nic_ctlr").pyclass() 
-        nic_backing = VI.ns0.VirtualEthernetCardNetworkBackingInfo_Def("nic_backing").pyclass() 
-        nic_backing.set_element_deviceName(net_name) 
-        nic_ctlr.set_element_addressType("generated") 
-        nic_ctlr.set_element_backing(nic_backing) 
-        nic_ctlr.set_element_key(4) 
-        nic_spec.set_element_device(nic_ctlr) 
-        devices.append(nic_spec)
-        
     if net_names:
         for net_name in net_names:
+            nic_spec = config.new_deviceChange()
             nic_spec.set_element_operation("add")
             nic_ctlr = VI.ns0.VirtualVmxnet3_Def("nic_ctlr").pyclass()
-            #nic_ctlr = VI.ns0.VirtualPCNet32_Def("nic_ctlr").pyclass()
-            nic_backing = VI.ns0.VirtualEthernetCardNetworkBackingInfo_Def("nic_backing").pyclass()
-            nic_backing.set_element_deviceName(net_name)
+            if network_type == 'dvs':
+                #get distributed vswitch uuid and portgroup number of net_name
+                (dvswitch_uuid, portgroupKey) = __get_dvsuuid_portgroup(host_con, dc_props, net_name)
+                #create the device
+                nic_backing_port = VI.ns0.DistributedVirtualSwitchPortConnection_Def("nic_backing_port").pyclass()
+                nic_backing_port.set_element_switchUuid(dvswitch_uuid)
+                nic_backing_port.set_element_portgroupKey(portgroupKey)
+                nic_backing = VI.ns0.VirtualEthernetCardDistributedVirtualPortBackingInfo_Def("nic_backing").pyclass()
+                nic_backing.set_element_port(nic_backing_port)
+            elif network_type == 'standard':
+                # Standard switch
+                nic_backing = VI.ns0.VirtualEthernetCardNetworkBackingInfo_Def("nic_backing").pyclass()
+                nic_backing.set_element_deviceName(net_name)
+            else:
+                return "Unknown network type '%s'" % network_type
             nic_ctlr.set_element_addressType("generated")
             nic_ctlr.set_element_backing(nic_backing)
             nic_ctlr.set_element_key(4)
             nic_spec.set_element_device(nic_ctlr)
             devices.append(nic_spec)
+    else:
+        nic_spec = config.new_deviceChange()
+        nic_spec.set_element_operation("add")
+        nic_ctlr = VI.ns0.VirtualVmxnet3_Def("nic_ctlr").pyclass()
+        if network_type == 'dvs':
+            #get distributed vswitch uuid and portgroup number of net_name
+            (dvswitch_uuid, portgroupKey) = __get_dvsuuid_portgroup(host_con, dc_props, net_name)
+            #create the device
+            nic_backing_port = VI.ns0.DistributedVirtualSwitchPortConnection_Def("nic_backing_port").pyclass()
+            nic_backing_port.set_element_switchUuid(dvswitch_uuid)
+            nic_backing_port.set_element_portgroupKey(portgroupKey)
+            nic_backing = VI.ns0.VirtualEthernetCardDistributedVirtualPortBackingInfo_Def("nic_backing").pyclass()
+            nic_backing.set_element_port(nic_backing_port)
+        elif network_type == 'standard':
+            # Standard switch
+            nic_backing = VI.ns0.VirtualEthernetCardNetworkBackingInfo_Def("nic_backing").pyclass()
+            nic_backing.set_element_deviceName(net_name)
+        else:
+            return "Unknown network type '%s'" % network_type
+        nic_ctlr.set_element_addressType("generated")
+        nic_ctlr.set_element_backing(nic_backing)
+        nic_ctlr.set_element_key(4)
+        nic_spec.set_element_device(nic_ctlr)
+        devices.append(nic_spec)
     
     #create vm request
     config.set_element_deviceChange(devices) 
@@ -263,10 +344,60 @@ def getMac(host_con,guest_name):
             if mac:
                 return mac
 
-    for v in vm.get_property("devices").values():
-        if v.get('macAddress'):
-            return v.get('macAddress')
+    #for v in vm.get_property("devices").values():
+    #    if v.get('macAddress'):
+    #        return v.get('macAddress')
+    
+    devs = vm.get_property('devices')
+    result = []
+    for dev in devs:
+       if devs[dev]['type'] == 'VirtualVmxnet3':
+          result.append(devs[dev]['macAddress'])
+    return result
 
 def powerOnGuest(host_con,guest_name):
-    vm=host_con.get_vm_by_name(guest_name)
-    vm.power_on()
+    try:
+        if host_con.get_vm_by_name(guest_name).get_status() != 'POWERED ON':
+            print 'Starting VM: %s' % guest_name
+            host_con.get_vm_by_name(guest_name).power_on()
+            print 'Waiting for VM to reach Up status'
+            while host_con.get_vm_by_name(guest_name).get_status() != 'POWERED ON':
+                sleep(1)
+        else:
+            print 'VM already up'
+    except Exception as e:
+        print 'Failed to Start VM: %s\n%s' % (guest_name, str(e))
+
+def powerOffGuest(host_con,guest_name):
+    try:
+        if host_con.get_vm_by_name(guest_name).get_status() != 'POWERED OFF':
+            print 'Stopping VM: %s' % guest_name
+            host_con.get_vm_by_name(guest_name).power_off()
+            print 'Waiting for VM to reach Down status'
+            while host_con.get_vm_by_name(guest_name).get_status() != 'POWERED OFF':
+                sleep(1)
+        else:
+            print 'VM already down'
+    except Exception as e:
+        print 'Failed to Stop VM: %s\n%s' % (guest_name, str(e))
+
+def destroyGuest(host_con, guest_name):
+    powerOffGuest(host_con, guest_name)
+    try:
+        vm = host_con.get_vm_by_name(guest_name)
+        request = VI.Destroy_TaskRequestMsg()
+        _this = request.new__this(vm._mor)
+        _this.set_attribute_type(vm._mor.get_attribute_type())
+        request.set_element__this(_this)
+        ret = host_con._proxy.Destroy_Task(request)._returnval
+        task = VITask(ret, host_con)
+        print 'Waiting for VM to be deleted'
+        status = task.wait_for_state([task.STATE_SUCCESS, task.STATE_ERROR])
+        if status == task.STATE_SUCCESS:
+            result = 'Succesfully removed guest: %s' % guest_name
+        elif status == task.STATE_ERROR:
+            result = 'Failed to remove VM: %s\n%s' % (guest_name, task.get_error_message())
+    except Exception as e:
+        result = 'Failed to remove VM: %s\n%s' % (guest_name, str(e))
+    return result
+
